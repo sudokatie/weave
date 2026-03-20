@@ -10,7 +10,7 @@ pub const wasi = @import("wasi/mod.zig");
 // Re-export common types
 pub const Module = binary.Module;
 pub const ValType = binary.ValType;
-pub const Value = runtime.Value;
+pub const Value = runtime.stack.Value;
 
 test {
     @import("std").testing.refAllDecls(@This());
