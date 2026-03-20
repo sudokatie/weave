@@ -1,6 +1,10 @@
-// Runtime module - TODO
+// Runtime module
 
 const binary = @import("../binary/mod.zig");
+pub const memory = @import("memory.zig");
+
+pub const Memory = memory.Memory;
+pub const PAGE_SIZE = memory.PAGE_SIZE;
 
 pub const Value = union(binary.ValType) {
     i32: i32,
@@ -12,9 +16,9 @@ pub const Value = union(binary.ValType) {
 };
 
 pub const Interpreter = struct {
-    // Placeholder
+    // Placeholder - TODO in Task 11
 };
 
 test {
-    @import("std").testing.refAllDecls(@This());
+    _ = memory;
 }
