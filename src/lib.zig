@@ -14,4 +14,5 @@ pub const Value = runtime.stack.Value;
 
 test {
     @import("std").testing.refAllDecls(@This());
+    _ = @import("test_integration.zig");
 }
