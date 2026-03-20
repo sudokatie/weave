@@ -3,6 +3,7 @@
 pub const memory = @import("memory.zig");
 pub const stack = @import("stack.zig");
 pub const interpreter = @import("interpreter.zig");
+pub const table = @import("table.zig");
 
 pub const Memory = memory.Memory;
 pub const PAGE_SIZE = memory.PAGE_SIZE;
@@ -11,9 +12,12 @@ pub const Value = stack.Value;
 pub const Frame = stack.Frame;
 pub const Label = stack.Label;
 pub const Interpreter = interpreter.Interpreter;
+pub const Table = table.Table;
+pub const Global = table.Global;
 
 test {
     _ = memory;
     _ = stack;
     _ = interpreter;
+    _ = table;
 }
