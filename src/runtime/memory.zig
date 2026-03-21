@@ -150,6 +150,42 @@ pub const Memory = struct {
         if (offset + data.len > self.data.len) return error.OutOfBounds;
         @memcpy(self.data[offset .. offset + data.len], data);
     }
+
+    /// Load u32 from memory
+    pub fn loadU32(self: *Memory, addr: u32) !u32 {
+        if (addr + 4 > self.data.len) return error.OutOfBounds;
+        return std.mem.readInt(u32, self.data[addr..][0..4], .little);
+    }
+
+    /// Load u64 from memory
+    pub fn loadU64(self: *Memory, addr: u32) !u64 {
+        if (addr + 8 > self.data.len) return error.OutOfBounds;
+        return std.mem.readInt(u64, self.data[addr..][0..8], .little);
+    }
+
+    /// Store u32 to memory
+    pub fn storeU32(self: *Memory, addr: u32, value: u32) !void {
+        if (addr + 4 > self.data.len) return error.OutOfBounds;
+        std.mem.writeInt(u32, self.data[addr..][0..4], value, .little);
+    }
+
+    /// Store u64 to memory
+    pub fn storeU64(self: *Memory, addr: u32, value: u64) !void {
+        if (addr + 8 > self.data.len) return error.OutOfBounds;
+        std.mem.writeInt(u64, self.data[addr..][0..8], value, .little);
+    }
+
+    /// Store single byte
+    pub fn store(self: *Memory, addr: u32, value: u8) !void {
+        if (addr >= self.data.len) return error.OutOfBounds;
+        self.data[addr] = value;
+    }
+
+    /// Get slice of memory
+    pub fn slice(self: *Memory, addr: u32, len: u32) ![]u8 {
+        if (addr + len > self.data.len) return error.OutOfBounds;
+        return self.data[addr .. addr + len];
+    }
 };
 
 // Tests
