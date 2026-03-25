@@ -15,6 +15,7 @@ pub const Module = struct {
     start: ?u32,
     code: []Code,
     data: []Data,
+    elements: []Element,
     allocator: std.mem.Allocator,
 
     pub const Global = struct {
@@ -64,6 +65,12 @@ pub const Module = struct {
         init: []const u8,
     };
 
+    pub const Element = struct {
+        table_idx: u32,
+        offset: []const u8, // Init expression
+        init: []u32, // Function indices
+    };
+
     const MAGIC = "\x00asm";
     const VERSION: u32 = 1;
 
@@ -89,6 +96,7 @@ pub const Module = struct {
             .start = null,
             .code = &.{},
             .data = &.{},
+            .elements = &.{},
             .allocator = allocator,
         };
         errdefer module.deinit();
@@ -109,7 +117,7 @@ pub const Module = struct {
                 6 => module.globals = try parseGlobalSection(&reader, allocator), // Global
                 7 => module.exports = try parseExportSection(&reader, allocator), // Export
                 8 => module.start = try reader.readU32Leb128(), // Start
-                9 => try reader.skip(section_size), // Element (TODO)
+                9 => module.elements = try parseElementSection(&reader, allocator), // Element
                 10 => module.code = try parseCodeSection(&reader, allocator), // Code
                 11 => module.data = try parseDataSection(&reader, allocator), // Data
                 else => try reader.skip(section_size), // Unknown
@@ -279,6 +287,36 @@ pub const Module = struct {
         return result;
     }
 
+    fn parseElementSection(reader: *Reader, allocator: std.mem.Allocator) ![]Element {
+        const count = try reader.readU32Leb128();
+        var result = try allocator.alloc(Element, count);
+        errdefer allocator.free(result);
+
+        for (0..count) |i| {
+            const table_idx = try reader.readU32Leb128();
+
+            // Read offset expression (until 0x0B)
+            const offset_start = reader.position;
+            while ((try reader.readByte()) != 0x0B) {}
+            const offset = reader.data[offset_start..reader.position];
+
+            // Read function indices
+            const func_count = try reader.readU32Leb128();
+            const init = try allocator.alloc(u32, func_count);
+            for (0..func_count) |j| {
+                init[j] = try reader.readU32Leb128();
+            }
+
+            result[i] = Element{
+                .table_idx = table_idx,
+                .offset = offset,
+                .init = init,
+            };
+        }
+
+        return result;
+    }
+
     fn parseDataSection(reader: *Reader, allocator: std.mem.Allocator) ![]Data {
         const count = try reader.readU32Leb128();
         var result = try allocator.alloc(Data, count);
@@ -323,6 +361,10 @@ pub const Module = struct {
         }
         if (self.code.len > 0) self.allocator.free(self.code);
         if (self.data.len > 0) self.allocator.free(self.data);
+        for (self.elements) |*e| {
+            if (e.init.len > 0) self.allocator.free(e.init);
+        }
+        if (self.elements.len > 0) self.allocator.free(self.elements);
     }
 };
 

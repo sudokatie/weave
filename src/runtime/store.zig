@@ -152,7 +152,46 @@ pub const Store = struct {
             .allocator = self.allocator,
         });
 
-        return &self.instances.items[self.instances.items.len - 1];
+        const instance = &self.instances.items[self.instances.items.len - 1];
+
+        // Initialize data segments
+        for (module.data) |data| {
+            if (data.mem_idx < mem_addrs.len) {
+                const mem = self.getMemory(mem_addrs[data.mem_idx]);
+                // Evaluate offset (simple case: i32.const followed by end)
+                const offset = evalConstExpr(data.offset);
+                mem.fill(offset, data.init) catch {};
+            }
+        }
+
+        // Initialize element segments
+        for (module.elements) |elem| {
+            if (elem.table_idx < table_addrs.len) {
+                const tbl = self.getTable(table_addrs[elem.table_idx]);
+                const offset = evalConstExpr(elem.offset);
+                for (elem.init, 0..) |func_idx, i| {
+                    tbl.set(offset + @as(u32, @intCast(i)), func_idx) catch {};
+                }
+            }
+        }
+
+        return instance;
+    }
+
+    /// Evaluate a constant expression (simplified: only handles i32.const)
+    fn evalConstExpr(expr: []const u8) u32 {
+        if (expr.len >= 2 and expr[0] == 0x41) { // i32.const
+            // Simple LEB128 decode
+            var result: u32 = 0;
+            var shift: u5 = 0;
+            for (expr[1..]) |byte| {
+                result |= @as(u32, byte & 0x7F) << shift;
+                if (byte & 0x80 == 0) break;
+                shift +|= 7;
+            }
+            return result;
+        }
+        return 0;
     }
 
     pub fn getFunc(self: *Store, addr: FuncAddr) *FuncInst {
