@@ -186,6 +186,23 @@ pub const Memory = struct {
         if (addr + len > self.data.len) return error.OutOfBounds;
         return self.data[addr .. addr + len];
     }
+
+    /// Read bytes from memory (for interpreter)
+    pub fn read(self: *Memory, addr: u32, len: usize) ?[]const u8 {
+        if (addr + len > self.data.len) return null;
+        return self.data[addr .. addr + len];
+    }
+
+    /// Write bytes to memory (for interpreter)
+    pub fn write(self: *Memory, addr: u32, bytes: []const u8) ?void {
+        if (addr + bytes.len > self.data.len) return null;
+        @memcpy(self.data[addr .. addr + bytes.len], bytes);
+    }
+
+    /// Page count (alias for size)
+    pub fn pageCount(self: *Memory) u32 {
+        return self.size();
+    }
 };
 
 // Tests

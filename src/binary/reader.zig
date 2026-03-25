@@ -4,29 +4,29 @@ const std = @import("std");
 
 pub const Reader = struct {
     data: []const u8,
-    pos: usize,
+    position: usize,
 
     pub fn init(data: []const u8) Reader {
-        return .{ .data = data, .pos = 0 };
+        return .{ .data = data, .position = 0 };
     }
 
     pub fn readByte(self: *Reader) !u8 {
-        if (self.pos >= self.data.len) return error.UnexpectedEof;
-        const b = self.data[self.pos];
-        self.pos += 1;
+        if (self.position >= self.data.len) return error.UnexpectedEof;
+        const b = self.data[self.position];
+        self.position += 1;
         return b;
     }
 
     pub fn readBytes(self: *Reader, n: usize) ![]const u8 {
-        if (self.pos + n > self.data.len) return error.UnexpectedEof;
-        const result = self.data[self.pos .. self.pos + n];
-        self.pos += n;
+        if (self.position + n > self.data.len) return error.UnexpectedEof;
+        const result = self.data[self.position .. self.position + n];
+        self.position += n;
         return result;
     }
 
     pub fn peekByte(self: *Reader) !u8 {
-        if (self.pos >= self.data.len) return error.UnexpectedEof;
-        return self.data[self.pos];
+        if (self.position >= self.data.len) return error.UnexpectedEof;
+        return self.data[self.position];
     }
 
     /// Read unsigned LEB128 encoded u32
@@ -111,6 +111,29 @@ pub const Reader = struct {
         return result;
     }
 
+    /// Read signed LEB128 encoded i33 (for block types)
+    pub fn readI33Leb128(self: *Reader) !i33 {
+        var result: i64 = 0;
+        var shift: u6 = 0;
+        var byte: u8 = 0;
+
+        while (true) {
+            byte = try self.readByte();
+            result |= @as(i64, @intCast(byte & 0x7F)) << shift;
+            shift += 7;
+
+            if (byte & 0x80 == 0) break;
+            if (shift >= 35) return error.LEB128Overflow;
+        }
+
+        // Sign extend
+        if (shift < 33 and (byte & 0x40) != 0) {
+            result |= @as(i64, -1) << shift;
+        }
+
+        return @intCast(result);
+    }
+
     /// Read IEEE 754 f32
     pub fn readF32(self: *Reader) !f32 {
         const bytes = try self.readBytes(4);
@@ -143,16 +166,16 @@ pub const Reader = struct {
     }
 
     pub fn atEnd(self: *Reader) bool {
-        return self.pos >= self.data.len;
+        return self.position >= self.data.len;
     }
 
     pub fn remaining(self: *Reader) usize {
-        return self.data.len - self.pos;
+        return self.data.len - self.position;
     }
 
     pub fn skip(self: *Reader, n: usize) !void {
-        if (self.pos + n > self.data.len) return error.UnexpectedEof;
-        self.pos += n;
+        if (self.position + n > self.data.len) return error.UnexpectedEof;
+        self.position += n;
     }
 };
 

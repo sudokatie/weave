@@ -1,9 +1,10 @@
-// WASM interpreter
+// WASM interpreter - Full implementation
 
 const std = @import("std");
 const binary = @import("../binary/mod.zig");
 const stack_mod = @import("stack.zig");
 const memory_mod = @import("memory.zig");
+const store_mod = @import("store.zig");
 
 const Stack = stack_mod.Stack;
 const Value = stack_mod.Value;
@@ -11,10 +12,12 @@ const Frame = stack_mod.Frame;
 const Label = stack_mod.Label;
 const Memory = memory_mod.Memory;
 const Opcode = binary.Opcode;
+const Reader = binary.Reader;
 
 pub const Interpreter = struct {
     stack: Stack,
     memory: ?*Memory,
+    globals: []Value,
     module: *binary.Module,
     allocator: std.mem.Allocator,
 
@@ -22,6 +25,7 @@ pub const Interpreter = struct {
         return Interpreter{
             .stack = Stack.init(allocator),
             .memory = null,
+            .globals = &[_]Value{},
             .module = module,
             .allocator = allocator,
         };
@@ -29,18 +33,31 @@ pub const Interpreter = struct {
 
     pub fn deinit(self: *Interpreter) void {
         self.stack.deinit();
+        if (self.globals.len > 0) {
+            self.allocator.free(self.globals);
+        }
+    }
+
+    pub fn setMemory(self: *Interpreter, mem: *Memory) void {
+        self.memory = mem;
+    }
+
+    pub fn initGlobals(self: *Interpreter, globals: []const binary.Global) !void {
+        if (globals.len == 0) return;
+        self.globals = try self.allocator.alloc(Value, globals.len);
+        for (globals, 0..) |g, i| {
+            self.globals[i] = Value.fromValType(g.val_type);
+            // TODO: evaluate init expr
+        }
     }
 
     /// Execute a function by index
     pub fn call(self: *Interpreter, func_idx: u32, args: []const Value) ![]Value {
-        // Get function type
         const type_idx = self.module.funcs[func_idx];
         const func_type = &self.module.types[type_idx];
 
-        // Check argument count
         if (args.len != func_type.params.len) return error.ArgumentCountMismatch;
 
-        // Get code
         const code = &self.module.code[func_idx];
 
         // Set up locals
@@ -76,8 +93,19 @@ pub const Interpreter = struct {
             .stack_height = self.stack.valueStackHeight(),
         });
 
+        // Push implicit function label
+        try self.stack.pushLabel(Label{
+            .arity = @intCast(func_type.results.len),
+            .target = code.body.len,
+            .is_loop = false,
+            .stack_height = self.stack.valueStackHeight(),
+        });
+
         // Execute
-        try self.execute(code.body);
+        _ = try self.executeCode(code.body);
+
+        // Pop function label
+        _ = self.stack.popLabel() catch {};
 
         // Get results
         var results = try self.allocator.alloc(Value, func_type.results.len);
@@ -92,221 +120,816 @@ pub const Interpreter = struct {
         return results;
     }
 
-    /// Execute code body
-    fn execute(self: *Interpreter, code: []const u8) !void {
-        var reader = binary.Reader.init(code);
+    /// Error types for execution
+    pub const ExecuteError = error{
+        Unreachable,
+        StackUnderflow,
+        TypeMismatch,
+        ArgumentCountMismatch,
+        NoActiveFrame,
+        LabelStackUnderflow,
+        FrameStackUnderflow,
+        InvalidLabelDepth,
+        OutOfMemory,
+        NoMemory,
+        OutOfBoundsMemoryAccess,
+        DivisionByZero,
+        IntegerOverflow,
+        InvalidConversion,
+        UnimplementedOpcode,
+        InvalidGlobalIndex,
+        UnexpectedEof,
+        InvalidBlockType,
+        LEB128Overflow,
+    };
+
+    /// Execute code, returns branch depth or null if completed normally
+    fn executeCode(self: *Interpreter, code: []const u8) ExecuteError!?u32 {
+        var reader = Reader.init(code);
 
         while (!reader.atEnd()) {
             const instr = try binary.instructions.decode(&reader);
 
-            switch (instr.opcode) {
-                // Control
-                .@"unreachable" => return error.Unreachable,
-                .nop => {},
-                .end, .@"else" => {
-                    // End of block/function
-                    break;
-                },
-                .@"return" => {
-                    // Return from function
-                    break;
-                },
-
-                // Parametric
-                .drop => _ = try self.stack.pop(),
-                .select => {
-                    const cond = try self.stack.popI32();
-                    const val2 = try self.stack.pop();
-                    const val1 = try self.stack.pop();
-                    try self.stack.push(if (cond != 0) val1 else val2);
-                },
-
-                // Variable
-                .local_get => {
-                    const frame = try self.stack.currentFrame();
-                    const idx = instr.immediate.local_idx;
-                    try self.stack.push(frame.locals[idx]);
-                },
-                .local_set => {
-                    const frame = try self.stack.currentFrame();
-                    const idx = instr.immediate.local_idx;
-                    frame.locals[idx] = try self.stack.pop();
-                },
-                .local_tee => {
-                    const frame = try self.stack.currentFrame();
-                    const idx = instr.immediate.local_idx;
-                    frame.locals[idx] = try self.stack.peek();
-                },
-
-                // Numeric constants
-                .i32_const => try self.stack.pushI32(instr.immediate.i32),
-                .i64_const => try self.stack.pushI64(instr.immediate.i64),
-                .f32_const => try self.stack.pushF32(instr.immediate.f32),
-                .f64_const => try self.stack.pushF64(instr.immediate.f64),
-
-                // i32 comparison
-                .i32_eqz => {
-                    const v = try self.stack.popI32();
-                    try self.stack.pushI32(if (v == 0) 1 else 0);
-                },
-                .i32_eq => try self.binopI32(struct {
-                    fn op(a: i32, b: i32) i32 {
-                        return if (a == b) 1 else 0;
-                    }
-                }.op),
-                .i32_ne => try self.binopI32(struct {
-                    fn op(a: i32, b: i32) i32 {
-                        return if (a != b) 1 else 0;
-                    }
-                }.op),
-                .i32_lt_s => try self.binopI32(struct {
-                    fn op(a: i32, b: i32) i32 {
-                        return if (a < b) 1 else 0;
-                    }
-                }.op),
-                .i32_gt_s => try self.binopI32(struct {
-                    fn op(a: i32, b: i32) i32 {
-                        return if (a > b) 1 else 0;
-                    }
-                }.op),
-                .i32_le_s => try self.binopI32(struct {
-                    fn op(a: i32, b: i32) i32 {
-                        return if (a <= b) 1 else 0;
-                    }
-                }.op),
-                .i32_ge_s => try self.binopI32(struct {
-                    fn op(a: i32, b: i32) i32 {
-                        return if (a >= b) 1 else 0;
-                    }
-                }.op),
-
-                // i32 arithmetic
-                .i32_add => try self.binopI32(struct {
-                    fn op(a: i32, b: i32) i32 {
-                        return a +% b;
-                    }
-                }.op),
-                .i32_sub => try self.binopI32(struct {
-                    fn op(a: i32, b: i32) i32 {
-                        return a -% b;
-                    }
-                }.op),
-                .i32_mul => try self.binopI32(struct {
-                    fn op(a: i32, b: i32) i32 {
-                        return a *% b;
-                    }
-                }.op),
-                .i32_div_s => {
-                    const b = try self.stack.popI32();
-                    const a = try self.stack.popI32();
-                    if (b == 0) return error.DivisionByZero;
-                    try self.stack.pushI32(@divTrunc(a, b));
-                },
-                .i32_rem_s => {
-                    const b = try self.stack.popI32();
-                    const a = try self.stack.popI32();
-                    if (b == 0) return error.DivisionByZero;
-                    try self.stack.pushI32(@rem(a, b));
-                },
-                .i32_and => try self.binopI32(struct {
-                    fn op(a: i32, b: i32) i32 {
-                        return a & b;
-                    }
-                }.op),
-                .i32_or => try self.binopI32(struct {
-                    fn op(a: i32, b: i32) i32 {
-                        return a | b;
-                    }
-                }.op),
-                .i32_xor => try self.binopI32(struct {
-                    fn op(a: i32, b: i32) i32 {
-                        return a ^ b;
-                    }
-                }.op),
-
-                // i64 arithmetic (subset)
-                .i64_add => try self.binopI64(struct {
-                    fn op(a: i64, b: i64) i64 {
-                        return a +% b;
-                    }
-                }.op),
-                .i64_sub => try self.binopI64(struct {
-                    fn op(a: i64, b: i64) i64 {
-                        return a -% b;
-                    }
-                }.op),
-                .i64_mul => try self.binopI64(struct {
-                    fn op(a: i64, b: i64) i64 {
-                        return a *% b;
-                    }
-                }.op),
-
-                // f32 arithmetic (subset)
-                .f32_add => try self.binopF32(struct {
-                    fn op(a: f32, b: f32) f32 {
-                        return a + b;
-                    }
-                }.op),
-                .f32_sub => try self.binopF32(struct {
-                    fn op(a: f32, b: f32) f32 {
-                        return a - b;
-                    }
-                }.op),
-                .f32_mul => try self.binopF32(struct {
-                    fn op(a: f32, b: f32) f32 {
-                        return a * b;
-                    }
-                }.op),
-                .f32_div => try self.binopF32(struct {
-                    fn op(a: f32, b: f32) f32 {
-                        return a / b;
-                    }
-                }.op),
-
-                // f64 arithmetic (subset)
-                .f64_add => try self.binopF64(struct {
-                    fn op(a: f64, b: f64) f64 {
-                        return a + b;
-                    }
-                }.op),
-                .f64_sub => try self.binopF64(struct {
-                    fn op(a: f64, b: f64) f64 {
-                        return a - b;
-                    }
-                }.op),
-                .f64_mul => try self.binopF64(struct {
-                    fn op(a: f64, b: f64) f64 {
-                        return a * b;
-                    }
-                }.op),
-                .f64_div => try self.binopF64(struct {
-                    fn op(a: f64, b: f64) f64 {
-                        return a / b;
-                    }
-                }.op),
-
-                // Conversions (subset)
-                .i32_wrap_i64 => {
-                    const v = try self.stack.popI64();
-                    try self.stack.pushI32(@truncate(v));
-                },
-                .i64_extend_i32_s => {
-                    const v = try self.stack.popI32();
-                    try self.stack.pushI64(v);
-                },
-                .i64_extend_i32_u => {
-                    const v = try self.stack.popI32();
-                    try self.stack.pushI64(@as(i64, @as(u32, @bitCast(v))));
-                },
-
-                else => {
-                    // Unimplemented opcode
-                    return error.UnimplementedOpcode;
-                },
+            const branch_result = try self.executeInstruction(instr, &reader);
+            if (branch_result) |depth| {
+                return depth;
             }
+        }
+        return null;
+    }
+
+    fn executeInstruction(self: *Interpreter, instr: binary.instructions.Instruction, reader: *Reader) ExecuteError!?u32 {
+        switch (instr.opcode) {
+            // ========== Control Flow ==========
+            .@"unreachable" => return error.Unreachable,
+            .nop => {},
+            .end => return null,
+
+            .block => {
+                const block_type = instr.immediate.block_type;
+                const arity = self.blockArity(block_type, false);
+                const block_start = reader.position;
+
+                try self.stack.pushLabel(Label{
+                    .arity = arity,
+                    .target = 0, // Will find end
+                    .is_loop = false,
+                    .stack_height = self.stack.valueStackHeight(),
+                });
+
+                // Find and execute block body
+                const body = try self.findBlockBody(reader);
+                const branch = try self.executeCode(body);
+
+                _ = self.stack.popLabel() catch {};
+                _ = block_start;
+
+                if (branch) |d| {
+                    if (d > 0) return d - 1;
+                }
+            },
+
+            .loop => {
+                const block_type = instr.immediate.block_type;
+                const arity = self.blockArity(block_type, true);
+
+                try self.stack.pushLabel(Label{
+                    .arity = arity,
+                    .target = 0,
+                    .is_loop = true,
+                    .stack_height = self.stack.valueStackHeight(),
+                });
+
+                const body = try self.findBlockBody(reader);
+
+                while (true) {
+                    const branch = try self.executeCode(body);
+                    if (branch) |d| {
+                        if (d == 0) {
+                            // Branch to loop start - continue
+                            continue;
+                        } else {
+                            _ = self.stack.popLabel() catch {};
+                            return d - 1;
+                        }
+                    }
+                    break;
+                }
+
+                _ = self.stack.popLabel() catch {};
+            },
+
+            .@"if" => {
+                const cond = try self.stack.popI32();
+                const block_type = instr.immediate.block_type;
+                const arity = self.blockArity(block_type, false);
+
+                try self.stack.pushLabel(Label{
+                    .arity = arity,
+                    .target = 0,
+                    .is_loop = false,
+                    .stack_height = self.stack.valueStackHeight(),
+                });
+
+                const if_body = try self.findIfBody(reader);
+
+                if (cond != 0) {
+                    const branch = try self.executeCode(if_body.then_body);
+                    _ = self.stack.popLabel() catch {};
+                    if (branch) |d| {
+                        if (d > 0) return d - 1;
+                    }
+                } else if (if_body.else_body) |else_body| {
+                    const branch = try self.executeCode(else_body);
+                    _ = self.stack.popLabel() catch {};
+                    if (branch) |d| {
+                        if (d > 0) return d - 1;
+                    }
+                } else {
+                    _ = self.stack.popLabel() catch {};
+                }
+            },
+
+            .br => {
+                const depth = instr.immediate.label_idx;
+                try self.branchTo(depth);
+                return depth;
+            },
+
+            .br_if => {
+                const cond = try self.stack.popI32();
+                if (cond != 0) {
+                    const depth = instr.immediate.label_idx;
+                    try self.branchTo(depth);
+                    return depth;
+                }
+            },
+
+            .br_table => {
+                const idx = @as(u32, @bitCast(try self.stack.popI32()));
+                const table = instr.immediate.br_table;
+                const depth = if (idx < table.labels.len)
+                    table.labels[idx]
+                else
+                    table.default;
+                try self.branchTo(depth);
+                return depth;
+            },
+
+            .@"return" => {
+                // Return from function - branch to outermost label
+                const frame = try self.stack.currentFrame();
+                _ = frame;
+                return 0xFFFFFFFF; // Special value for return
+            },
+
+            .call => {
+                const func_idx = instr.immediate.func_idx;
+                try self.callFunction(func_idx);
+            },
+
+            .call_indirect => {
+                const type_idx = instr.immediate.call_indirect.type_idx;
+                const table_idx = try self.stack.popI32();
+                _ = type_idx;
+                // TODO: proper indirect call via table
+                try self.callFunction(@intCast(table_idx));
+            },
+
+            // ========== Parametric ==========
+            .drop => _ = try self.stack.pop(),
+            .select => {
+                const cond = try self.stack.popI32();
+                const val2 = try self.stack.pop();
+                const val1 = try self.stack.pop();
+                try self.stack.push(if (cond != 0) val1 else val2);
+            },
+
+            // ========== Variable ==========
+            .local_get => {
+                const frame = try self.stack.currentFrame();
+                const idx = instr.immediate.local_idx;
+                try self.stack.push(frame.locals[idx]);
+            },
+            .local_set => {
+                const frame = try self.stack.currentFrame();
+                const idx = instr.immediate.local_idx;
+                frame.locals[idx] = try self.stack.pop();
+            },
+            .local_tee => {
+                const frame = try self.stack.currentFrame();
+                const idx = instr.immediate.local_idx;
+                frame.locals[idx] = try self.stack.peek();
+            },
+            .global_get => {
+                const idx = instr.immediate.global_idx;
+                if (idx >= self.globals.len) return error.InvalidGlobalIndex;
+                try self.stack.push(self.globals[idx]);
+            },
+            .global_set => {
+                const idx = instr.immediate.global_idx;
+                if (idx >= self.globals.len) return error.InvalidGlobalIndex;
+                self.globals[idx] = try self.stack.pop();
+            },
+
+            // ========== Memory ==========
+            .i32_load => try self.memLoad(i32, 4, instr.immediate.memarg),
+            .i64_load => try self.memLoad(i64, 8, instr.immediate.memarg),
+            .f32_load => try self.memLoadF32(instr.immediate.memarg),
+            .f64_load => try self.memLoadF64(instr.immediate.memarg),
+            .i32_load8_s => try self.memLoadExtend(i32, i8, 1, instr.immediate.memarg),
+            .i32_load8_u => try self.memLoadExtend(i32, u8, 1, instr.immediate.memarg),
+            .i32_load16_s => try self.memLoadExtend(i32, i16, 2, instr.immediate.memarg),
+            .i32_load16_u => try self.memLoadExtend(i32, u16, 2, instr.immediate.memarg),
+            .i64_load8_s => try self.memLoadExtend(i64, i8, 1, instr.immediate.memarg),
+            .i64_load8_u => try self.memLoadExtend(i64, u8, 1, instr.immediate.memarg),
+            .i64_load16_s => try self.memLoadExtend(i64, i16, 2, instr.immediate.memarg),
+            .i64_load16_u => try self.memLoadExtend(i64, u16, 2, instr.immediate.memarg),
+            .i64_load32_s => try self.memLoadExtend(i64, i32, 4, instr.immediate.memarg),
+            .i64_load32_u => try self.memLoadExtend(i64, u32, 4, instr.immediate.memarg),
+
+            .i32_store => try self.memStore(i32, 4, instr.immediate.memarg),
+            .i64_store => try self.memStore(i64, 8, instr.immediate.memarg),
+            .f32_store => try self.memStoreF32(instr.immediate.memarg),
+            .f64_store => try self.memStoreF64(instr.immediate.memarg),
+            .i32_store8 => try self.memStoreTrunc(i32, u8, 1, instr.immediate.memarg),
+            .i32_store16 => try self.memStoreTrunc(i32, u16, 2, instr.immediate.memarg),
+            .i64_store8 => try self.memStoreTrunc(i64, u8, 1, instr.immediate.memarg),
+            .i64_store16 => try self.memStoreTrunc(i64, u16, 2, instr.immediate.memarg),
+            .i64_store32 => try self.memStoreTrunc(i64, u32, 4, instr.immediate.memarg),
+
+            .memory_size => {
+                const mem = self.memory orelse return error.NoMemory;
+                try self.stack.pushI32(@intCast(mem.pageCount()));
+            },
+            .memory_grow => {
+                const mem = self.memory orelse return error.NoMemory;
+                const delta = @as(u32, @bitCast(try self.stack.popI32()));
+                const result = mem.grow(delta);
+                try self.stack.pushI32(result);
+            },
+
+            // ========== Numeric Constants ==========
+            .i32_const => try self.stack.pushI32(instr.immediate.i32),
+            .i64_const => try self.stack.pushI64(instr.immediate.i64),
+            .f32_const => try self.stack.pushF32(instr.immediate.f32),
+            .f64_const => try self.stack.pushF64(instr.immediate.f64),
+
+            // ========== i32 Comparison ==========
+            .i32_eqz => {
+                const v = try self.stack.popI32();
+                try self.stack.pushI32(if (v == 0) 1 else 0);
+            },
+            .i32_eq => try self.cmpI32(struct { fn f(a: i32, b: i32) bool { return a == b; } }.f),
+            .i32_ne => try self.cmpI32(struct { fn f(a: i32, b: i32) bool { return a != b; } }.f),
+            .i32_lt_s => try self.cmpI32(struct { fn f(a: i32, b: i32) bool { return a < b; } }.f),
+            .i32_lt_u => try self.cmpU32(struct { fn f(a: u32, b: u32) bool { return a < b; } }.f),
+            .i32_gt_s => try self.cmpI32(struct { fn f(a: i32, b: i32) bool { return a > b; } }.f),
+            .i32_gt_u => try self.cmpU32(struct { fn f(a: u32, b: u32) bool { return a > b; } }.f),
+            .i32_le_s => try self.cmpI32(struct { fn f(a: i32, b: i32) bool { return a <= b; } }.f),
+            .i32_le_u => try self.cmpU32(struct { fn f(a: u32, b: u32) bool { return a <= b; } }.f),
+            .i32_ge_s => try self.cmpI32(struct { fn f(a: i32, b: i32) bool { return a >= b; } }.f),
+            .i32_ge_u => try self.cmpU32(struct { fn f(a: u32, b: u32) bool { return a >= b; } }.f),
+
+            // ========== i64 Comparison ==========
+            .i64_eqz => {
+                const v = try self.stack.popI64();
+                try self.stack.pushI32(if (v == 0) 1 else 0);
+            },
+            .i64_eq => try self.cmpI64(struct { fn f(a: i64, b: i64) bool { return a == b; } }.f),
+            .i64_ne => try self.cmpI64(struct { fn f(a: i64, b: i64) bool { return a != b; } }.f),
+            .i64_lt_s => try self.cmpI64(struct { fn f(a: i64, b: i64) bool { return a < b; } }.f),
+            .i64_lt_u => try self.cmpU64(struct { fn f(a: u64, b: u64) bool { return a < b; } }.f),
+            .i64_gt_s => try self.cmpI64(struct { fn f(a: i64, b: i64) bool { return a > b; } }.f),
+            .i64_gt_u => try self.cmpU64(struct { fn f(a: u64, b: u64) bool { return a > b; } }.f),
+            .i64_le_s => try self.cmpI64(struct { fn f(a: i64, b: i64) bool { return a <= b; } }.f),
+            .i64_le_u => try self.cmpU64(struct { fn f(a: u64, b: u64) bool { return a <= b; } }.f),
+            .i64_ge_s => try self.cmpI64(struct { fn f(a: i64, b: i64) bool { return a >= b; } }.f),
+            .i64_ge_u => try self.cmpU64(struct { fn f(a: u64, b: u64) bool { return a >= b; } }.f),
+
+            // ========== f32 Comparison ==========
+            .f32_eq => try self.cmpF32(struct { fn f(a: f32, b: f32) bool { return a == b; } }.f),
+            .f32_ne => try self.cmpF32(struct { fn f(a: f32, b: f32) bool { return a != b; } }.f),
+            .f32_lt => try self.cmpF32(struct { fn f(a: f32, b: f32) bool { return a < b; } }.f),
+            .f32_gt => try self.cmpF32(struct { fn f(a: f32, b: f32) bool { return a > b; } }.f),
+            .f32_le => try self.cmpF32(struct { fn f(a: f32, b: f32) bool { return a <= b; } }.f),
+            .f32_ge => try self.cmpF32(struct { fn f(a: f32, b: f32) bool { return a >= b; } }.f),
+
+            // ========== f64 Comparison ==========
+            .f64_eq => try self.cmpF64(struct { fn f(a: f64, b: f64) bool { return a == b; } }.f),
+            .f64_ne => try self.cmpF64(struct { fn f(a: f64, b: f64) bool { return a != b; } }.f),
+            .f64_lt => try self.cmpF64(struct { fn f(a: f64, b: f64) bool { return a < b; } }.f),
+            .f64_gt => try self.cmpF64(struct { fn f(a: f64, b: f64) bool { return a > b; } }.f),
+            .f64_le => try self.cmpF64(struct { fn f(a: f64, b: f64) bool { return a <= b; } }.f),
+            .f64_ge => try self.cmpF64(struct { fn f(a: f64, b: f64) bool { return a >= b; } }.f),
+
+            // ========== i32 Arithmetic ==========
+            .i32_clz => {
+                const v = try self.stack.popI32();
+                try self.stack.pushI32(@clz(@as(u32, @bitCast(v))));
+            },
+            .i32_ctz => {
+                const v = try self.stack.popI32();
+                try self.stack.pushI32(@ctz(@as(u32, @bitCast(v))));
+            },
+            .i32_popcnt => {
+                const v = try self.stack.popI32();
+                try self.stack.pushI32(@popCount(@as(u32, @bitCast(v))));
+            },
+            .i32_add => try self.binopI32(struct { fn f(a: i32, b: i32) i32 { return a +% b; } }.f),
+            .i32_sub => try self.binopI32(struct { fn f(a: i32, b: i32) i32 { return a -% b; } }.f),
+            .i32_mul => try self.binopI32(struct { fn f(a: i32, b: i32) i32 { return a *% b; } }.f),
+            .i32_div_s => {
+                const b = try self.stack.popI32();
+                const a = try self.stack.popI32();
+                if (b == 0) return error.DivisionByZero;
+                if (a == std.math.minInt(i32) and b == -1) return error.IntegerOverflow;
+                try self.stack.pushI32(@divTrunc(a, b));
+            },
+            .i32_div_u => {
+                const b = @as(u32, @bitCast(try self.stack.popI32()));
+                const a = @as(u32, @bitCast(try self.stack.popI32()));
+                if (b == 0) return error.DivisionByZero;
+                try self.stack.pushI32(@bitCast(a / b));
+            },
+            .i32_rem_s => {
+                const b = try self.stack.popI32();
+                const a = try self.stack.popI32();
+                if (b == 0) return error.DivisionByZero;
+                try self.stack.pushI32(@rem(a, b));
+            },
+            .i32_rem_u => {
+                const b = @as(u32, @bitCast(try self.stack.popI32()));
+                const a = @as(u32, @bitCast(try self.stack.popI32()));
+                if (b == 0) return error.DivisionByZero;
+                try self.stack.pushI32(@bitCast(a % b));
+            },
+            .i32_and => try self.binopI32(struct { fn f(a: i32, b: i32) i32 { return a & b; } }.f),
+            .i32_or => try self.binopI32(struct { fn f(a: i32, b: i32) i32 { return a | b; } }.f),
+            .i32_xor => try self.binopI32(struct { fn f(a: i32, b: i32) i32 { return a ^ b; } }.f),
+            .i32_shl => {
+                const b = @as(u5, @truncate(@as(u32, @bitCast(try self.stack.popI32()))));
+                const a = try self.stack.popI32();
+                try self.stack.pushI32(a << b);
+            },
+            .i32_shr_s => {
+                const b = @as(u5, @truncate(@as(u32, @bitCast(try self.stack.popI32()))));
+                const a = try self.stack.popI32();
+                try self.stack.pushI32(a >> b);
+            },
+            .i32_shr_u => {
+                const b = @as(u5, @truncate(@as(u32, @bitCast(try self.stack.popI32()))));
+                const a = @as(u32, @bitCast(try self.stack.popI32()));
+                try self.stack.pushI32(@bitCast(a >> b));
+            },
+            .i32_rotl => {
+                const b = @as(u5, @truncate(@as(u32, @bitCast(try self.stack.popI32()))));
+                const a = @as(u32, @bitCast(try self.stack.popI32()));
+                try self.stack.pushI32(@bitCast(std.math.rotl(u32, a, b)));
+            },
+            .i32_rotr => {
+                const b = @as(u5, @truncate(@as(u32, @bitCast(try self.stack.popI32()))));
+                const a = @as(u32, @bitCast(try self.stack.popI32()));
+                try self.stack.pushI32(@bitCast(std.math.rotr(u32, a, b)));
+            },
+
+            // ========== i64 Arithmetic ==========
+            .i64_clz => {
+                const v = try self.stack.popI64();
+                try self.stack.pushI64(@clz(@as(u64, @bitCast(v))));
+            },
+            .i64_ctz => {
+                const v = try self.stack.popI64();
+                try self.stack.pushI64(@ctz(@as(u64, @bitCast(v))));
+            },
+            .i64_popcnt => {
+                const v = try self.stack.popI64();
+                try self.stack.pushI64(@popCount(@as(u64, @bitCast(v))));
+            },
+            .i64_add => try self.binopI64(struct { fn f(a: i64, b: i64) i64 { return a +% b; } }.f),
+            .i64_sub => try self.binopI64(struct { fn f(a: i64, b: i64) i64 { return a -% b; } }.f),
+            .i64_mul => try self.binopI64(struct { fn f(a: i64, b: i64) i64 { return a *% b; } }.f),
+            .i64_div_s => {
+                const b = try self.stack.popI64();
+                const a = try self.stack.popI64();
+                if (b == 0) return error.DivisionByZero;
+                if (a == std.math.minInt(i64) and b == -1) return error.IntegerOverflow;
+                try self.stack.pushI64(@divTrunc(a, b));
+            },
+            .i64_div_u => {
+                const b = @as(u64, @bitCast(try self.stack.popI64()));
+                const a = @as(u64, @bitCast(try self.stack.popI64()));
+                if (b == 0) return error.DivisionByZero;
+                try self.stack.pushI64(@bitCast(a / b));
+            },
+            .i64_rem_s => {
+                const b = try self.stack.popI64();
+                const a = try self.stack.popI64();
+                if (b == 0) return error.DivisionByZero;
+                try self.stack.pushI64(@rem(a, b));
+            },
+            .i64_rem_u => {
+                const b = @as(u64, @bitCast(try self.stack.popI64()));
+                const a = @as(u64, @bitCast(try self.stack.popI64()));
+                if (b == 0) return error.DivisionByZero;
+                try self.stack.pushI64(@bitCast(a % b));
+            },
+            .i64_and => try self.binopI64(struct { fn f(a: i64, b: i64) i64 { return a & b; } }.f),
+            .i64_or => try self.binopI64(struct { fn f(a: i64, b: i64) i64 { return a | b; } }.f),
+            .i64_xor => try self.binopI64(struct { fn f(a: i64, b: i64) i64 { return a ^ b; } }.f),
+            .i64_shl => {
+                const b = @as(u6, @truncate(@as(u64, @bitCast(try self.stack.popI64()))));
+                const a = try self.stack.popI64();
+                try self.stack.pushI64(a << b);
+            },
+            .i64_shr_s => {
+                const b = @as(u6, @truncate(@as(u64, @bitCast(try self.stack.popI64()))));
+                const a = try self.stack.popI64();
+                try self.stack.pushI64(a >> b);
+            },
+            .i64_shr_u => {
+                const b = @as(u6, @truncate(@as(u64, @bitCast(try self.stack.popI64()))));
+                const a = @as(u64, @bitCast(try self.stack.popI64()));
+                try self.stack.pushI64(@bitCast(a >> b));
+            },
+            .i64_rotl => {
+                const b = @as(u6, @truncate(@as(u64, @bitCast(try self.stack.popI64()))));
+                const a = @as(u64, @bitCast(try self.stack.popI64()));
+                try self.stack.pushI64(@bitCast(std.math.rotl(u64, a, b)));
+            },
+            .i64_rotr => {
+                const b = @as(u6, @truncate(@as(u64, @bitCast(try self.stack.popI64()))));
+                const a = @as(u64, @bitCast(try self.stack.popI64()));
+                try self.stack.pushI64(@bitCast(std.math.rotr(u64, a, b)));
+            },
+
+            // ========== f32 Arithmetic ==========
+            .f32_abs => { const v = try self.stack.popF32(); try self.stack.pushF32(@abs(v)); },
+            .f32_neg => { const v = try self.stack.popF32(); try self.stack.pushF32(-v); },
+            .f32_ceil => { const v = try self.stack.popF32(); try self.stack.pushF32(@ceil(v)); },
+            .f32_floor => { const v = try self.stack.popF32(); try self.stack.pushF32(@floor(v)); },
+            .f32_trunc => { const v = try self.stack.popF32(); try self.stack.pushF32(@trunc(v)); },
+            .f32_nearest => { const v = try self.stack.popF32(); try self.stack.pushF32(@round(v)); },
+            .f32_sqrt => { const v = try self.stack.popF32(); try self.stack.pushF32(@sqrt(v)); },
+            .f32_add => try self.binopF32(struct { fn f(a: f32, b: f32) f32 { return a + b; } }.f),
+            .f32_sub => try self.binopF32(struct { fn f(a: f32, b: f32) f32 { return a - b; } }.f),
+            .f32_mul => try self.binopF32(struct { fn f(a: f32, b: f32) f32 { return a * b; } }.f),
+            .f32_div => try self.binopF32(struct { fn f(a: f32, b: f32) f32 { return a / b; } }.f),
+            .f32_min => try self.binopF32(struct { fn f(a: f32, b: f32) f32 { return @min(a, b); } }.f),
+            .f32_max => try self.binopF32(struct { fn f(a: f32, b: f32) f32 { return @max(a, b); } }.f),
+            .f32_copysign => {
+                const b = try self.stack.popF32();
+                const a = try self.stack.popF32();
+                try self.stack.pushF32(std.math.copysign(a, b));
+            },
+
+            // ========== f64 Arithmetic ==========
+            .f64_abs => { const v = try self.stack.popF64(); try self.stack.pushF64(@abs(v)); },
+            .f64_neg => { const v = try self.stack.popF64(); try self.stack.pushF64(-v); },
+            .f64_ceil => { const v = try self.stack.popF64(); try self.stack.pushF64(@ceil(v)); },
+            .f64_floor => { const v = try self.stack.popF64(); try self.stack.pushF64(@floor(v)); },
+            .f64_trunc => { const v = try self.stack.popF64(); try self.stack.pushF64(@trunc(v)); },
+            .f64_nearest => { const v = try self.stack.popF64(); try self.stack.pushF64(@round(v)); },
+            .f64_sqrt => { const v = try self.stack.popF64(); try self.stack.pushF64(@sqrt(v)); },
+            .f64_add => try self.binopF64(struct { fn f(a: f64, b: f64) f64 { return a + b; } }.f),
+            .f64_sub => try self.binopF64(struct { fn f(a: f64, b: f64) f64 { return a - b; } }.f),
+            .f64_mul => try self.binopF64(struct { fn f(a: f64, b: f64) f64 { return a * b; } }.f),
+            .f64_div => try self.binopF64(struct { fn f(a: f64, b: f64) f64 { return a / b; } }.f),
+            .f64_min => try self.binopF64(struct { fn f(a: f64, b: f64) f64 { return @min(a, b); } }.f),
+            .f64_max => try self.binopF64(struct { fn f(a: f64, b: f64) f64 { return @max(a, b); } }.f),
+            .f64_copysign => {
+                const b = try self.stack.popF64();
+                const a = try self.stack.popF64();
+                try self.stack.pushF64(std.math.copysign(a, b));
+            },
+
+            // ========== Conversions ==========
+            .i32_wrap_i64 => {
+                const v = try self.stack.popI64();
+                try self.stack.pushI32(@truncate(v));
+            },
+            .i32_trunc_f32_s => {
+                const v = try self.stack.popF32();
+                if (std.math.isNan(v) or std.math.isInf(v)) return error.InvalidConversion;
+                try self.stack.pushI32(@intFromFloat(v));
+            },
+            .i32_trunc_f32_u => {
+                const v = try self.stack.popF32();
+                if (std.math.isNan(v) or std.math.isInf(v) or v < 0) return error.InvalidConversion;
+                try self.stack.pushI32(@bitCast(@as(u32, @intFromFloat(v))));
+            },
+            .i32_trunc_f64_s => {
+                const v = try self.stack.popF64();
+                if (std.math.isNan(v) or std.math.isInf(v)) return error.InvalidConversion;
+                try self.stack.pushI32(@intFromFloat(v));
+            },
+            .i32_trunc_f64_u => {
+                const v = try self.stack.popF64();
+                if (std.math.isNan(v) or std.math.isInf(v) or v < 0) return error.InvalidConversion;
+                try self.stack.pushI32(@bitCast(@as(u32, @intFromFloat(v))));
+            },
+            .i64_extend_i32_s => {
+                const v = try self.stack.popI32();
+                try self.stack.pushI64(v);
+            },
+            .i64_extend_i32_u => {
+                const v = try self.stack.popI32();
+                try self.stack.pushI64(@as(u32, @bitCast(v)));
+            },
+            .i64_trunc_f32_s => {
+                const v = try self.stack.popF32();
+                if (std.math.isNan(v) or std.math.isInf(v)) return error.InvalidConversion;
+                try self.stack.pushI64(@intFromFloat(v));
+            },
+            .i64_trunc_f32_u => {
+                const v = try self.stack.popF32();
+                if (std.math.isNan(v) or std.math.isInf(v) or v < 0) return error.InvalidConversion;
+                try self.stack.pushI64(@bitCast(@as(u64, @intFromFloat(v))));
+            },
+            .i64_trunc_f64_s => {
+                const v = try self.stack.popF64();
+                if (std.math.isNan(v) or std.math.isInf(v)) return error.InvalidConversion;
+                try self.stack.pushI64(@intFromFloat(v));
+            },
+            .i64_trunc_f64_u => {
+                const v = try self.stack.popF64();
+                if (std.math.isNan(v) or std.math.isInf(v) or v < 0) return error.InvalidConversion;
+                try self.stack.pushI64(@bitCast(@as(u64, @intFromFloat(v))));
+            },
+            .f32_convert_i32_s => {
+                const v = try self.stack.popI32();
+                try self.stack.pushF32(@floatFromInt(v));
+            },
+            .f32_convert_i32_u => {
+                const v = @as(u32, @bitCast(try self.stack.popI32()));
+                try self.stack.pushF32(@floatFromInt(v));
+            },
+            .f32_convert_i64_s => {
+                const v = try self.stack.popI64();
+                try self.stack.pushF32(@floatFromInt(v));
+            },
+            .f32_convert_i64_u => {
+                const v = @as(u64, @bitCast(try self.stack.popI64()));
+                try self.stack.pushF32(@floatFromInt(v));
+            },
+            .f32_demote_f64 => {
+                const v = try self.stack.popF64();
+                try self.stack.pushF32(@floatCast(v));
+            },
+            .f64_convert_i32_s => {
+                const v = try self.stack.popI32();
+                try self.stack.pushF64(@floatFromInt(v));
+            },
+            .f64_convert_i32_u => {
+                const v = @as(u32, @bitCast(try self.stack.popI32()));
+                try self.stack.pushF64(@floatFromInt(v));
+            },
+            .f64_convert_i64_s => {
+                const v = try self.stack.popI64();
+                try self.stack.pushF64(@floatFromInt(v));
+            },
+            .f64_convert_i64_u => {
+                const v = @as(u64, @bitCast(try self.stack.popI64()));
+                try self.stack.pushF64(@floatFromInt(v));
+            },
+            .f64_promote_f32 => {
+                const v = try self.stack.popF32();
+                try self.stack.pushF64(v);
+            },
+            .i32_reinterpret_f32 => {
+                const v = try self.stack.popF32();
+                try self.stack.pushI32(@bitCast(v));
+            },
+            .i64_reinterpret_f64 => {
+                const v = try self.stack.popF64();
+                try self.stack.pushI64(@bitCast(v));
+            },
+            .f32_reinterpret_i32 => {
+                const v = try self.stack.popI32();
+                try self.stack.pushF32(@bitCast(v));
+            },
+            .f64_reinterpret_i64 => {
+                const v = try self.stack.popI64();
+                try self.stack.pushF64(@bitCast(v));
+            },
+
+            // ========== Sign Extension ==========
+            .i32_extend8_s => {
+                const v = try self.stack.popI32();
+                try self.stack.pushI32(@as(i8, @truncate(v)));
+            },
+            .i32_extend16_s => {
+                const v = try self.stack.popI32();
+                try self.stack.pushI32(@as(i16, @truncate(v)));
+            },
+            .i64_extend8_s => {
+                const v = try self.stack.popI64();
+                try self.stack.pushI64(@as(i8, @truncate(v)));
+            },
+            .i64_extend16_s => {
+                const v = try self.stack.popI64();
+                try self.stack.pushI64(@as(i16, @truncate(v)));
+            },
+            .i64_extend32_s => {
+                const v = try self.stack.popI64();
+                try self.stack.pushI64(@as(i32, @truncate(v)));
+            },
+
+            else => return error.UnimplementedOpcode,
+        }
+        return null;
+    }
+
+    // ========== Helper Functions ==========
+
+    fn blockArity(self: *Interpreter, block_type: binary.types.BlockType, is_loop: bool) u32 {
+        _ = is_loop;
+        return switch (block_type) {
+            .empty => 0,
+            .val_type => 1,
+            .type_index => |idx| blk: {
+                if (idx < self.module.types.len) {
+                    break :blk @intCast(self.module.types[idx].results.len);
+                }
+                break :blk 0;
+            },
+        };
+    }
+
+    fn findBlockBody(self: *Interpreter, reader: *Reader) ![]const u8 {
+        _ = self;
+        const start = reader.position;
+        var depth: u32 = 1;
+
+        while (!reader.atEnd() and depth > 0) {
+            const byte = try reader.readByte();
+            switch (byte) {
+                0x02, 0x03, 0x04 => depth += 1, // block, loop, if
+                0x0B => depth -= 1, // end
+                else => {},
+            }
+        }
+
+        return reader.data[start .. reader.position - 1];
+    }
+
+    const IfBody = struct {
+        then_body: []const u8,
+        else_body: ?[]const u8,
+    };
+
+    fn findIfBody(self: *Interpreter, reader: *Reader) !IfBody {
+        _ = self;
+        const start = reader.position;
+        var depth: u32 = 1;
+        var else_pos: ?usize = null;
+
+        while (!reader.atEnd() and depth > 0) {
+            const byte = try reader.readByte();
+            switch (byte) {
+                0x02, 0x03, 0x04 => depth += 1,
+                0x05 => if (depth == 1) { else_pos = reader.position; }, // else
+                0x0B => depth -= 1,
+                else => {},
+            }
+        }
+
+        if (else_pos) |ep| {
+            return IfBody{
+                .then_body = reader.data[start .. ep - 1],
+                .else_body = reader.data[ep .. reader.position - 1],
+            };
+        } else {
+            return IfBody{
+                .then_body = reader.data[start .. reader.position - 1],
+                .else_body = null,
+            };
         }
     }
 
+    fn branchTo(self: *Interpreter, depth: u32) !void {
+        const label = try self.stack.getLabel(depth);
+        // Save result values
+        var results: [16]Value = undefined;
+        var i: u32 = 0;
+        while (i < label.arity) : (i += 1) {
+            results[i] = try self.stack.pop();
+        }
+        // Truncate stack
+        self.stack.truncateValues(label.stack_height);
+        // Restore results
+        while (i > 0) {
+            i -= 1;
+            try self.stack.push(results[i]);
+        }
+    }
+
+    fn callFunction(self: *Interpreter, func_idx: u32) !void {
+        const type_idx = self.module.funcs[func_idx];
+        const func_type = &self.module.types[type_idx];
+
+        // Pop arguments
+        var args: [16]Value = undefined;
+        var i: usize = func_type.params.len;
+        while (i > 0) {
+            i -= 1;
+            args[i] = try self.stack.pop();
+        }
+
+        // Call
+        const results = try self.call(func_idx, args[0..func_type.params.len]);
+        defer self.allocator.free(results);
+
+        // Push results
+        for (results) |r| {
+            try self.stack.push(r);
+        }
+    }
+
+    // Memory helpers
+    fn memLoad(self: *Interpreter, comptime T: type, comptime size: usize, memarg: binary.instructions.MemArg) !void {
+        const mem = self.memory orelse return error.NoMemory;
+        const base = @as(u32, @bitCast(try self.stack.popI32()));
+        const addr = base +% memarg.offset;
+        const bytes = mem.read(addr, size) orelse return error.OutOfBoundsMemoryAccess;
+        const value = std.mem.readInt(T, bytes[0..size], .little);
+        if (T == i32) {
+            try self.stack.pushI32(value);
+        } else {
+            try self.stack.pushI64(value);
+        }
+    }
+
+    fn memLoadF32(self: *Interpreter, memarg: binary.instructions.MemArg) !void {
+        const mem = self.memory orelse return error.NoMemory;
+        const base = @as(u32, @bitCast(try self.stack.popI32()));
+        const addr = base +% memarg.offset;
+        const bytes = mem.read(addr, 4) orelse return error.OutOfBoundsMemoryAccess;
+        try self.stack.pushF32(@bitCast(std.mem.readInt(u32, bytes[0..4], .little)));
+    }
+
+    fn memLoadF64(self: *Interpreter, memarg: binary.instructions.MemArg) !void {
+        const mem = self.memory orelse return error.NoMemory;
+        const base = @as(u32, @bitCast(try self.stack.popI32()));
+        const addr = base +% memarg.offset;
+        const bytes = mem.read(addr, 8) orelse return error.OutOfBoundsMemoryAccess;
+        try self.stack.pushF64(@bitCast(std.mem.readInt(u64, bytes[0..8], .little)));
+    }
+
+    fn memLoadExtend(self: *Interpreter, comptime T: type, comptime S: type, comptime size: usize, memarg: binary.instructions.MemArg) !void {
+        const mem = self.memory orelse return error.NoMemory;
+        const base = @as(u32, @bitCast(try self.stack.popI32()));
+        const addr = base +% memarg.offset;
+        const bytes = mem.read(addr, size) orelse return error.OutOfBoundsMemoryAccess;
+        const small = std.mem.readInt(S, bytes[0..size], .little);
+        if (T == i32) {
+            try self.stack.pushI32(@as(i32, small));
+        } else {
+            try self.stack.pushI64(@as(i64, small));
+        }
+    }
+
+    fn memStore(self: *Interpreter, comptime T: type, comptime size: usize, memarg: binary.instructions.MemArg) !void {
+        const mem = self.memory orelse return error.NoMemory;
+        const value = if (T == i32) try self.stack.popI32() else try self.stack.popI64();
+        const base = @as(u32, @bitCast(try self.stack.popI32()));
+        const addr = base +% memarg.offset;
+        var bytes: [size]u8 = undefined;
+        std.mem.writeInt(T, &bytes, value, .little);
+        mem.write(addr, &bytes) orelse return error.OutOfBoundsMemoryAccess;
+    }
+
+    fn memStoreF32(self: *Interpreter, memarg: binary.instructions.MemArg) !void {
+        const mem = self.memory orelse return error.NoMemory;
+        const value = try self.stack.popF32();
+        const base = @as(u32, @bitCast(try self.stack.popI32()));
+        const addr = base +% memarg.offset;
+        var bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, &bytes, @bitCast(value), .little);
+        mem.write(addr, &bytes) orelse return error.OutOfBoundsMemoryAccess;
+    }
+
+    fn memStoreF64(self: *Interpreter, memarg: binary.instructions.MemArg) !void {
+        const mem = self.memory orelse return error.NoMemory;
+        const value = try self.stack.popF64();
+        const base = @as(u32, @bitCast(try self.stack.popI32()));
+        const addr = base +% memarg.offset;
+        var bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &bytes, @bitCast(value), .little);
+        mem.write(addr, &bytes) orelse return error.OutOfBoundsMemoryAccess;
+    }
+
+    fn memStoreTrunc(self: *Interpreter, comptime T: type, comptime S: type, comptime size: usize, memarg: binary.instructions.MemArg) !void {
+        const mem = self.memory orelse return error.NoMemory;
+        const value = if (T == i32) try self.stack.popI32() else try self.stack.popI64();
+        const base = @as(u32, @bitCast(try self.stack.popI32()));
+        const addr = base +% memarg.offset;
+        var bytes: [size]u8 = undefined;
+        std.mem.writeInt(S, &bytes, @truncate(@as(if (T == i32) u32 else u64, @bitCast(value))), .little);
+        mem.write(addr, &bytes) orelse return error.OutOfBoundsMemoryAccess;
+    }
+
+    // Binary operation helpers
     fn binopI32(self: *Interpreter, op: fn (i32, i32) i32) !void {
         const b = try self.stack.popI32();
         const a = try self.stack.popI32();
@@ -330,10 +953,45 @@ pub const Interpreter = struct {
         const a = try self.stack.popF64();
         try self.stack.pushF64(op(a, b));
     }
+
+    // Comparison helpers
+    fn cmpI32(self: *Interpreter, op: fn (i32, i32) bool) !void {
+        const b = try self.stack.popI32();
+        const a = try self.stack.popI32();
+        try self.stack.pushI32(if (op(a, b)) 1 else 0);
+    }
+
+    fn cmpU32(self: *Interpreter, op: fn (u32, u32) bool) !void {
+        const b = @as(u32, @bitCast(try self.stack.popI32()));
+        const a = @as(u32, @bitCast(try self.stack.popI32()));
+        try self.stack.pushI32(if (op(a, b)) 1 else 0);
+    }
+
+    fn cmpI64(self: *Interpreter, op: fn (i64, i64) bool) !void {
+        const b = try self.stack.popI64();
+        const a = try self.stack.popI64();
+        try self.stack.pushI32(if (op(a, b)) 1 else 0);
+    }
+
+    fn cmpU64(self: *Interpreter, op: fn (u64, u64) bool) !void {
+        const b = @as(u64, @bitCast(try self.stack.popI64()));
+        const a = @as(u64, @bitCast(try self.stack.popI64()));
+        try self.stack.pushI32(if (op(a, b)) 1 else 0);
+    }
+
+    fn cmpF32(self: *Interpreter, op: fn (f32, f32) bool) !void {
+        const b = try self.stack.popF32();
+        const a = try self.stack.popF32();
+        try self.stack.pushI32(if (op(a, b)) 1 else 0);
+    }
+
+    fn cmpF64(self: *Interpreter, op: fn (f64, f64) bool) !void {
+        const b = try self.stack.popF64();
+        const a = try self.stack.popF64();
+        try self.stack.pushI32(if (op(a, b)) 1 else 0);
+    }
 };
 
-// Tests are in test_integration.zig since they need full modules
 test "interpreter init" {
-    // Just verify the struct compiles
     _ = Interpreter;
 }

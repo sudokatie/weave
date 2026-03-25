@@ -216,17 +216,29 @@ pub const Opcode = enum(u8) {
     _,
 };
 
+/// Memory argument for load/store instructions
+pub const MemArg = struct {
+    align_: u32,
+    offset: u32,
+};
+
+/// Branch table immediate
+pub const BrTable = struct {
+    labels: []const u32,
+    default: u32,
+};
+
 /// Instruction immediate operands
 pub const Immediate = union(enum) {
     none,
     block_type: types.BlockType,
     label_idx: u32,
-    labels: []const u32, // For br_table
+    br_table: BrTable,
     func_idx: u32,
     call_indirect: struct { type_idx: u32, table_idx: u32 },
     local_idx: u32,
     global_idx: u32,
-    mem_arg: struct { align_: u32, offset: u32 },
+    memarg: MemArg,
     i32: i32,
     i64: i64,
     f32: f32,
@@ -251,15 +263,16 @@ pub fn decode(reader: *Reader) !Instruction {
         // Branch
         .br, .br_if => Immediate{ .label_idx = try reader.readU32Leb128() },
 
-        // br_table (variable length)
+        // br_table (variable length) - use static buffer for now
         .br_table => blk: {
-            // Read label count + labels + default
-            // For now, skip the labels (we'd need allocator)
             const count = try reader.readU32Leb128();
-            for (0..count + 1) |_| {
+            // Skip labels for now (would need allocator for dynamic)
+            var default: u32 = 0;
+            for (0..count) |_| {
                 _ = try reader.readU32Leb128();
             }
-            break :blk Immediate{ .none = {} };
+            default = try reader.readU32Leb128();
+            break :blk Immediate{ .br_table = .{ .labels = &[_]u32{}, .default = default } };
         },
 
         // Call
@@ -281,7 +294,7 @@ pub fn decode(reader: *Reader) !Instruction {
         .i32_store, .i64_store, .f32_store, .f64_store,
         .i32_store8, .i32_store16,
         .i64_store8, .i64_store16, .i64_store32,
-        => Immediate{ .mem_arg = .{
+        => Immediate{ .memarg = .{
             .align_ = try reader.readU32Leb128(),
             .offset = try reader.readU32Leb128(),
         } },
@@ -362,6 +375,6 @@ test "decode memory load" {
     const instr = try decode(&reader);
 
     try std.testing.expectEqual(Opcode.i32_load, instr.opcode);
-    try std.testing.expectEqual(@as(u32, 2), instr.immediate.mem_arg.align_);
-    try std.testing.expectEqual(@as(u32, 16), instr.immediate.mem_arg.offset);
+    try std.testing.expectEqual(@as(u32, 2), instr.immediate.memarg.align_);
+    try std.testing.expectEqual(@as(u32, 16), instr.immediate.memarg.offset);
 }

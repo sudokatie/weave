@@ -97,7 +97,7 @@ pub const Module = struct {
         while (!reader.atEnd()) {
             const section_id = try reader.readByte();
             const section_size = try reader.readU32Leb128();
-            const section_end = reader.pos + section_size;
+            const section_end = reader.position + section_size;
 
             switch (section_id) {
                 0 => try reader.skip(section_size), // Custom section
@@ -116,9 +116,9 @@ pub const Module = struct {
             }
 
             // Ensure we consumed exactly section_size bytes
-            if (reader.pos != section_end) {
-                if (reader.pos < section_end) {
-                    try reader.skip(section_end - reader.pos);
+            if (reader.position != section_end) {
+                if (reader.position < section_end) {
+                    try reader.skip(section_end - reader.position);
                 } else {
                     return error.SectionOverflow;
                 }
@@ -212,9 +212,9 @@ pub const Module = struct {
         for (0..count) |i| {
             const global_type = try types.GlobalType.read(reader);
             // Read init expression (until 0x0B = end)
-            const start = reader.pos;
+            const start = reader.position;
             while ((try reader.readByte()) != 0x0B) {}
-            const init = reader.data[start..reader.pos];
+            const init = reader.data[start..reader.position];
 
             result[i] = Global{
                 .global_type = global_type,
@@ -252,7 +252,7 @@ pub const Module = struct {
 
         for (0..count) |i| {
             const code_size = try reader.readU32Leb128();
-            const code_end = reader.pos + code_size;
+            const code_end = reader.position + code_size;
 
             // Parse locals
             const local_count = try reader.readU32Leb128();
@@ -267,8 +267,8 @@ pub const Module = struct {
             }
 
             // Body is the rest until code_end
-            const body = reader.data[reader.pos..code_end];
-            reader.pos = code_end;
+            const body = reader.data[reader.position..code_end];
+            reader.position = code_end;
 
             result[i] = Code{
                 .locals = locals,
@@ -288,9 +288,9 @@ pub const Module = struct {
             const mem_idx = try reader.readU32Leb128();
 
             // Read offset expression (until 0x0B)
-            const offset_start = reader.pos;
+            const offset_start = reader.position;
             while ((try reader.readByte()) != 0x0B) {}
-            const offset = reader.data[offset_start..reader.pos];
+            const offset = reader.data[offset_start..reader.position];
 
             // Read data bytes
             const data_len = try reader.readU32Leb128();
