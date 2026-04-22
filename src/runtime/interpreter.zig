@@ -5,12 +5,14 @@ const binary = @import("../binary/mod.zig");
 const stack_mod = @import("stack.zig");
 const memory_mod = @import("memory.zig");
 const store_mod = @import("store.zig");
+const table_mod = @import("table.zig");
 
 const Stack = stack_mod.Stack;
 const Value = stack_mod.Value;
 const Frame = stack_mod.Frame;
 const Label = stack_mod.Label;
 const Memory = memory_mod.Memory;
+const Table = table_mod.Table;
 const Opcode = binary.Opcode;
 const Reader = binary.Reader;
 
@@ -18,6 +20,7 @@ pub const Interpreter = struct {
     stack: Stack,
     memory: ?*Memory,
     globals: []Value,
+    tables: []Table,
     module: *binary.Module,
     allocator: std.mem.Allocator,
 
@@ -26,6 +29,7 @@ pub const Interpreter = struct {
             .stack = Stack.init(allocator),
             .memory = null,
             .globals = &[_]Value{},
+            .tables = &[_]Table{},
             .module = module,
             .allocator = allocator,
         };
@@ -42,13 +46,59 @@ pub const Interpreter = struct {
         self.memory = mem;
     }
 
-    pub fn initGlobals(self: *Interpreter, globals: []const binary.Global) !void {
+    pub fn setTables(self: *Interpreter, tables: []Table) void {
+        self.tables = tables;
+    }
+
+    pub fn initGlobals(self: *Interpreter, globals: []const binary.Module.Global) !void {
         if (globals.len == 0) return;
         self.globals = try self.allocator.alloc(Value, globals.len);
         for (globals, 0..) |g, i| {
-            self.globals[i] = Value.fromValType(g.val_type);
-            // TODO: evaluate init expr
+            // Evaluate init expression for this global
+            self.globals[i] = self.evaluateInitExpr(g.init) catch
+                Value.fromValType(g.global_type.val_type);
         }
+    }
+
+    /// Evaluate a constant init expression and return the resulting Value
+    /// Handles: i32.const, i64.const, f32.const, f64.const, global.get, end
+    fn evaluateInitExpr(self: *Interpreter, expr: []const u8) ExecuteError!Value {
+        var reader = Reader.init(expr);
+
+        while (!reader.atEnd()) {
+            const opcode = reader.readByte() catch return error.UnexpectedEof;
+
+            switch (opcode) {
+                0x41 => { // i32.const
+                    const val = reader.readI32Leb128() catch return error.LEB128Overflow;
+                    return Value{ .i32 = val };
+                },
+                0x42 => { // i64.const
+                    const val = reader.readI64Leb128() catch return error.LEB128Overflow;
+                    return Value{ .i64 = val };
+                },
+                0x43 => { // f32.const
+                    const val = reader.readF32() catch return error.UnexpectedEof;
+                    return Value{ .f32 = val };
+                },
+                0x44 => { // f64.const
+                    const val = reader.readF64() catch return error.UnexpectedEof;
+                    return Value{ .f64 = val };
+                },
+                0x23 => { // global.get
+                    const idx = reader.readU32Leb128() catch return error.LEB128Overflow;
+                    if (idx >= self.globals.len) return error.InvalidGlobalIndex;
+                    return self.globals[idx];
+                },
+                0x0B => { // end
+                    // Should have returned a value before reaching end
+                    return error.InvalidInitExpression;
+                },
+                else => return error.InvalidInitExpression,
+            }
+        }
+
+        return error.UnexpectedEof;
     }
 
     /// Execute a function by index
@@ -141,6 +191,10 @@ pub const Interpreter = struct {
         UnexpectedEof,
         InvalidBlockType,
         LEB128Overflow,
+        InvalidInitExpression,
+        UndefinedElement,
+        IndirectCallTypeMismatch,
+        TableOutOfBounds,
     };
 
     /// Execute code, returns branch depth or null if completed normally
@@ -290,10 +344,53 @@ pub const Interpreter = struct {
 
             .call_indirect => {
                 const type_idx = instr.immediate.call_indirect.type_idx;
-                const table_idx = try self.stack.popI32();
-                _ = type_idx;
-                // TODO: proper indirect call via table
-                try self.callFunction(@intCast(table_idx));
+                const tbl_idx = instr.immediate.call_indirect.table_idx;
+
+                // Pop the element index from the stack
+                const elem_idx = @as(u32, @bitCast(try self.stack.popI32()));
+
+                // Get the table
+                if (tbl_idx >= self.tables.len) return error.TableOutOfBounds;
+                const table = &self.tables[tbl_idx];
+
+                // Look up the function reference in the table
+                const func_ref = table.get(elem_idx) catch return error.TableOutOfBounds;
+
+                // Check if the table entry is null (undefined element)
+                const func_idx = func_ref orelse return error.UndefinedElement;
+
+                // Validate the function exists
+                if (func_idx >= self.module.funcs.len) return error.UndefinedElement;
+
+                // Type check: verify the function's type matches the expected type
+                const actual_type_idx = self.module.funcs[func_idx];
+                if (actual_type_idx != type_idx) {
+                    // Compare the actual type signatures
+                    if (type_idx >= self.module.types.len or actual_type_idx >= self.module.types.len) {
+                        return error.IndirectCallTypeMismatch;
+                    }
+                    const expected_type = &self.module.types[type_idx];
+                    const actual_type = &self.module.types[actual_type_idx];
+
+                    // Check params match
+                    if (expected_type.params.len != actual_type.params.len) {
+                        return error.IndirectCallTypeMismatch;
+                    }
+                    for (expected_type.params, actual_type.params) |e, a| {
+                        if (e != a) return error.IndirectCallTypeMismatch;
+                    }
+
+                    // Check results match
+                    if (expected_type.results.len != actual_type.results.len) {
+                        return error.IndirectCallTypeMismatch;
+                    }
+                    for (expected_type.results, actual_type.results) |e, a| {
+                        if (e != a) return error.IndirectCallTypeMismatch;
+                    }
+                }
+
+                // Call the function
+                try self.callFunction(func_idx);
             },
 
             // ========== Parametric ==========
@@ -994,4 +1091,436 @@ pub const Interpreter = struct {
 
 test "interpreter init" {
     _ = Interpreter;
+}
+
+// Init expression evaluation tests
+test "interpreter evaluateInitExpr i32.const" {
+    const allocator = std.testing.allocator;
+
+    // Minimal module
+    const wasm = "\x00asm\x01\x00\x00\x00";
+    var module = try binary.Module.parse(allocator, wasm);
+    defer module.deinit();
+
+    var interp = Interpreter.init(allocator, &module);
+    defer interp.deinit();
+
+    // i32.const 42, end
+    const expr = &[_]u8{ 0x41, 0x2a, 0x0b };
+    const val = try interp.evaluateInitExpr(expr);
+    try std.testing.expectEqual(@as(i32, 42), val.i32);
+}
+
+test "interpreter evaluateInitExpr i64.const" {
+    const allocator = std.testing.allocator;
+
+    const wasm = "\x00asm\x01\x00\x00\x00";
+    var module = try binary.Module.parse(allocator, wasm);
+    defer module.deinit();
+
+    var interp = Interpreter.init(allocator, &module);
+    defer interp.deinit();
+
+    // i64.const 999, end
+    const expr = &[_]u8{ 0x42, 0xe7, 0x07, 0x0b };
+    const val = try interp.evaluateInitExpr(expr);
+    try std.testing.expectEqual(@as(i64, 999), val.i64);
+}
+
+test "interpreter evaluateInitExpr f32.const" {
+    const allocator = std.testing.allocator;
+
+    const wasm = "\x00asm\x01\x00\x00\x00";
+    var module = try binary.Module.parse(allocator, wasm);
+    defer module.deinit();
+
+    var interp = Interpreter.init(allocator, &module);
+    defer interp.deinit();
+
+    // f32.const 3.14159..., end
+    const expr = &[_]u8{ 0x43, 0xdb, 0x0f, 0x49, 0x40, 0x0b };
+    const val = try interp.evaluateInitExpr(expr);
+    try std.testing.expect(@abs(val.f32 - 3.14159) < 0.001);
+}
+
+test "interpreter evaluateInitExpr f64.const" {
+    const allocator = std.testing.allocator;
+
+    const wasm = "\x00asm\x01\x00\x00\x00";
+    var module = try binary.Module.parse(allocator, wasm);
+    defer module.deinit();
+
+    var interp = Interpreter.init(allocator, &module);
+    defer interp.deinit();
+
+    // f64.const 1.0, end
+    const expr = &[_]u8{ 0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x3f, 0x0b };
+    const val = try interp.evaluateInitExpr(expr);
+    try std.testing.expectEqual(@as(f64, 1.0), val.f64);
+}
+
+test "interpreter evaluateInitExpr global.get" {
+    const allocator = std.testing.allocator;
+
+    const wasm = "\x00asm\x01\x00\x00\x00";
+    var module = try binary.Module.parse(allocator, wasm);
+    defer module.deinit();
+
+    var interp = Interpreter.init(allocator, &module);
+    defer interp.deinit();
+
+    // Set up a global
+    interp.globals = try allocator.alloc(Value, 1);
+    interp.globals[0] = Value{ .i32 = 789 };
+
+    // global.get 0, end
+    const expr = &[_]u8{ 0x23, 0x00, 0x0b };
+    const val = try interp.evaluateInitExpr(expr);
+    try std.testing.expectEqual(@as(i32, 789), val.i32);
+}
+
+test "interpreter evaluateInitExpr invalid opcode" {
+    const allocator = std.testing.allocator;
+
+    const wasm = "\x00asm\x01\x00\x00\x00";
+    var module = try binary.Module.parse(allocator, wasm);
+    defer module.deinit();
+
+    var interp = Interpreter.init(allocator, &module);
+    defer interp.deinit();
+
+    // nop (not allowed), end
+    const expr = &[_]u8{ 0x01, 0x0b };
+    try std.testing.expectError(error.InvalidInitExpression, interp.evaluateInitExpr(expr));
+}
+
+test "interpreter evaluateInitExpr invalid global index" {
+    const allocator = std.testing.allocator;
+
+    const wasm = "\x00asm\x01\x00\x00\x00";
+    var module = try binary.Module.parse(allocator, wasm);
+    defer module.deinit();
+
+    var interp = Interpreter.init(allocator, &module);
+    defer interp.deinit();
+
+    // global.get 5 (doesn't exist), end
+    const expr = &[_]u8{ 0x23, 0x05, 0x0b };
+    try std.testing.expectError(error.InvalidGlobalIndex, interp.evaluateInitExpr(expr));
+}
+
+test "interpreter initGlobals with init expressions" {
+    const allocator = std.testing.allocator;
+
+    // Module with global section containing i32.const 42
+    const wasm = "\x00asm\x01\x00\x00\x00" ++
+        "\x06\x06\x01\x7f\x00\x41\x2a\x0b"; // global section: i32, immutable, i32.const 42, end
+
+    var module = try binary.Module.parse(allocator, wasm);
+    defer module.deinit();
+
+    var interp = Interpreter.init(allocator, &module);
+    defer interp.deinit();
+
+    try interp.initGlobals(module.globals);
+
+    try std.testing.expectEqual(@as(usize, 1), interp.globals.len);
+    try std.testing.expectEqual(@as(i32, 42), interp.globals[0].i32);
+}
+
+// Indirect call tests
+test "interpreter call_indirect valid" {
+    const allocator = std.testing.allocator;
+
+    // Module with a table, a function, and element initialization
+    // Type: () -> i32
+    // Function: returns 42
+    // Table: 1 element
+    // Element: table[0] = func 0
+    const wasm = "\x00asm\x01\x00\x00\x00" ++
+        "\x01\x05\x01\x60\x00\x01\x7f" ++ // type section: () -> i32
+        "\x03\x02\x01\x00" ++ // function section: 1 func, type 0
+        "\x04\x04\x01\x70\x00\x01" ++ // table section: funcref, min=1
+        "\x09\x07\x01\x00\x41\x00\x0b\x01\x00" ++ // element section: table 0, offset 0, [func 0]
+        "\x0a\x06\x01\x04\x00\x41\x2a\x0b"; // code section: i32.const 42, end
+
+    var module = try binary.Module.parse(allocator, wasm);
+    defer module.deinit();
+
+    var interp = Interpreter.init(allocator, &module);
+    defer interp.deinit();
+
+    // Set up table
+    var tables = try allocator.alloc(Table, 1);
+    defer allocator.free(tables);
+    tables[0] = try Table.init(allocator, .{ .elem_type = .funcref, .limits = .{ .min = 1, .max = null } });
+    defer tables[0].deinit();
+    try tables[0].set(0, 0); // table[0] = func 0
+
+    interp.setTables(tables);
+
+    // Push table index on stack and call indirectly
+    try interp.stack.pushI32(0); // element index 0
+
+    // Create call_indirect instruction
+    const instr = binary.instructions.Instruction{
+        .opcode = .call_indirect,
+        .immediate = .{ .call_indirect = .{ .type_idx = 0, .table_idx = 0 } },
+    };
+
+    var reader = Reader.init(&[_]u8{});
+    _ = try interp.executeInstruction(instr, &reader);
+
+    // Result should be on stack
+    const result = try interp.stack.popI32();
+    try std.testing.expectEqual(@as(i32, 42), result);
+}
+
+test "interpreter call_indirect null entry" {
+    const allocator = std.testing.allocator;
+
+    const wasm = "\x00asm\x01\x00\x00\x00" ++
+        "\x01\x05\x01\x60\x00\x01\x7f" ++ // type section: () -> i32
+        "\x03\x02\x01\x00" ++ // function section: 1 func, type 0
+        "\x04\x04\x01\x70\x00\x02" ++ // table section: funcref, min=2
+        "\x0a\x06\x01\x04\x00\x41\x2a\x0b"; // code section
+
+    var module = try binary.Module.parse(allocator, wasm);
+    defer module.deinit();
+
+    var interp = Interpreter.init(allocator, &module);
+    defer interp.deinit();
+
+    var tables = try allocator.alloc(Table, 1);
+    defer allocator.free(tables);
+    tables[0] = try Table.init(allocator, .{ .elem_type = .funcref, .limits = .{ .min = 2, .max = null } });
+    defer tables[0].deinit();
+    // table[0] is null (not initialized)
+    try tables[0].set(1, 0); // only table[1] = func 0
+
+    interp.setTables(tables);
+
+    try interp.stack.pushI32(0); // element index 0 (null)
+
+    const instr = binary.instructions.Instruction{
+        .opcode = .call_indirect,
+        .immediate = .{ .call_indirect = .{ .type_idx = 0, .table_idx = 0 } },
+    };
+
+    var reader = Reader.init(&[_]u8{});
+    try std.testing.expectError(error.UndefinedElement, interp.executeInstruction(instr, &reader));
+}
+
+test "interpreter call_indirect out of bounds" {
+    const allocator = std.testing.allocator;
+
+    const wasm = "\x00asm\x01\x00\x00\x00" ++
+        "\x01\x05\x01\x60\x00\x01\x7f" ++
+        "\x03\x02\x01\x00" ++
+        "\x04\x04\x01\x70\x00\x01" ++
+        "\x0a\x06\x01\x04\x00\x41\x2a\x0b";
+
+    var module = try binary.Module.parse(allocator, wasm);
+    defer module.deinit();
+
+    var interp = Interpreter.init(allocator, &module);
+    defer interp.deinit();
+
+    var tables = try allocator.alloc(Table, 1);
+    defer allocator.free(tables);
+    tables[0] = try Table.init(allocator, .{ .elem_type = .funcref, .limits = .{ .min = 1, .max = null } });
+    defer tables[0].deinit();
+
+    interp.setTables(tables);
+
+    try interp.stack.pushI32(99); // element index 99 (out of bounds)
+
+    const instr = binary.instructions.Instruction{
+        .opcode = .call_indirect,
+        .immediate = .{ .call_indirect = .{ .type_idx = 0, .table_idx = 0 } },
+    };
+
+    var reader = Reader.init(&[_]u8{});
+    try std.testing.expectError(error.TableOutOfBounds, interp.executeInstruction(instr, &reader));
+}
+
+test "interpreter call_indirect type mismatch" {
+    const allocator = std.testing.allocator;
+
+    // Two types: () -> i32 and (i32) -> i32
+    // Type section: count=2, type0=(0x60,0x00,0x01,0x7f), type1=(0x60,0x01,0x7f,0x01,0x7f)
+    // Size = 1 + 4 + 5 = 10 bytes = 0x0a
+    const wasm = "\x00asm\x01\x00\x00\x00" ++
+        "\x01\x0a\x02\x60\x00\x01\x7f\x60\x01\x7f\x01\x7f" ++ // type section: () -> i32, (i32) -> i32
+        "\x03\x02\x01\x00" ++ // function section: 1 func, type 0 (no params)
+        "\x04\x04\x01\x70\x00\x01" ++ // table section
+        "\x0a\x06\x01\x04\x00\x41\x2a\x0b"; // code section
+
+    var module = try binary.Module.parse(allocator, wasm);
+    defer module.deinit();
+
+    var interp = Interpreter.init(allocator, &module);
+    defer interp.deinit();
+
+    var tables = try allocator.alloc(Table, 1);
+    defer allocator.free(tables);
+    tables[0] = try Table.init(allocator, .{ .elem_type = .funcref, .limits = .{ .min = 1, .max = null } });
+    defer tables[0].deinit();
+    try tables[0].set(0, 0); // table[0] = func 0 (which has type 0)
+
+    interp.setTables(tables);
+
+    try interp.stack.pushI32(0); // element index 0
+
+    // call_indirect with type 1 (expects i32 param), but func 0 has type 0 (no params)
+    const instr = binary.instructions.Instruction{
+        .opcode = .call_indirect,
+        .immediate = .{ .call_indirect = .{ .type_idx = 1, .table_idx = 0 } },
+    };
+
+    var reader = Reader.init(&[_]u8{});
+    try std.testing.expectError(error.IndirectCallTypeMismatch, interp.executeInstruction(instr, &reader));
+}
+
+test "interpreter call_indirect multiple calls" {
+    const allocator = std.testing.allocator;
+
+    // Two functions: func0 returns 10, func1 returns 20
+    const wasm = "\x00asm\x01\x00\x00\x00" ++
+        "\x01\x05\x01\x60\x00\x01\x7f" ++ // type section: () -> i32
+        "\x03\x03\x02\x00\x00" ++ // function section: 2 funcs, both type 0
+        "\x04\x04\x01\x70\x00\x02" ++ // table section: min=2
+        "\x0a\x0b\x02\x04\x00\x41\x0a\x0b\x04\x00\x41\x14\x0b"; // code: const 10, const 20
+
+    var module = try binary.Module.parse(allocator, wasm);
+    defer module.deinit();
+
+    var interp = Interpreter.init(allocator, &module);
+    defer interp.deinit();
+
+    var tables = try allocator.alloc(Table, 1);
+    defer allocator.free(tables);
+    tables[0] = try Table.init(allocator, .{ .elem_type = .funcref, .limits = .{ .min = 2, .max = null } });
+    defer tables[0].deinit();
+    try tables[0].set(0, 0); // table[0] = func 0
+    try tables[0].set(1, 1); // table[1] = func 1
+
+    interp.setTables(tables);
+
+    // First call: table[0] -> func 0 -> 10
+    try interp.stack.pushI32(0);
+    const instr = binary.instructions.Instruction{
+        .opcode = .call_indirect,
+        .immediate = .{ .call_indirect = .{ .type_idx = 0, .table_idx = 0 } },
+    };
+    var reader = Reader.init(&[_]u8{});
+    _ = try interp.executeInstruction(instr, &reader);
+    try std.testing.expectEqual(@as(i32, 10), try interp.stack.popI32());
+
+    // Second call: table[1] -> func 1 -> 20
+    try interp.stack.pushI32(1);
+    _ = try interp.executeInstruction(instr, &reader);
+    try std.testing.expectEqual(@as(i32, 20), try interp.stack.popI32());
+}
+
+test "interpreter call_indirect table index out of bounds" {
+    const allocator = std.testing.allocator;
+
+    const wasm = "\x00asm\x01\x00\x00\x00" ++
+        "\x01\x05\x01\x60\x00\x01\x7f" ++
+        "\x03\x02\x01\x00" ++
+        "\x0a\x06\x01\x04\x00\x41\x2a\x0b";
+
+    var module = try binary.Module.parse(allocator, wasm);
+    defer module.deinit();
+
+    var interp = Interpreter.init(allocator, &module);
+    defer interp.deinit();
+
+    // No tables set
+    interp.tables = &[_]Table{};
+
+    try interp.stack.pushI32(0);
+
+    // call_indirect with table_idx=0, but no tables exist
+    const instr = binary.instructions.Instruction{
+        .opcode = .call_indirect,
+        .immediate = .{ .call_indirect = .{ .type_idx = 0, .table_idx = 0 } },
+    };
+
+    var reader = Reader.init(&[_]u8{});
+    try std.testing.expectError(error.TableOutOfBounds, interp.executeInstruction(instr, &reader));
+}
+
+test "interpreter call_indirect same type different index" {
+    const allocator = std.testing.allocator;
+
+    // Two identical types (structurally equal)
+    const wasm = "\x00asm\x01\x00\x00\x00" ++
+        "\x01\x09\x02\x60\x00\x01\x7f\x60\x00\x01\x7f" ++ // two () -> i32 types
+        "\x03\x02\x01\x01" ++ // func uses type 1
+        "\x04\x04\x01\x70\x00\x01" ++
+        "\x0a\x06\x01\x04\x00\x41\x2a\x0b";
+
+    var module = try binary.Module.parse(allocator, wasm);
+    defer module.deinit();
+
+    var interp = Interpreter.init(allocator, &module);
+    defer interp.deinit();
+
+    var tables = try allocator.alloc(Table, 1);
+    defer allocator.free(tables);
+    tables[0] = try Table.init(allocator, .{ .elem_type = .funcref, .limits = .{ .min = 1, .max = null } });
+    defer tables[0].deinit();
+    try tables[0].set(0, 0);
+
+    interp.setTables(tables);
+
+    try interp.stack.pushI32(0);
+
+    // call_indirect with type 0, but func has type 1 (structurally equal)
+    const instr = binary.instructions.Instruction{
+        .opcode = .call_indirect,
+        .immediate = .{ .call_indirect = .{ .type_idx = 0, .table_idx = 0 } },
+    };
+
+    var reader = Reader.init(&[_]u8{});
+    // Should succeed because types are structurally equal
+    _ = try interp.executeInstruction(instr, &reader);
+    try std.testing.expectEqual(@as(i32, 42), try interp.stack.popI32());
+}
+
+test "interpreter call_indirect negative index" {
+    const allocator = std.testing.allocator;
+
+    const wasm = "\x00asm\x01\x00\x00\x00" ++
+        "\x01\x05\x01\x60\x00\x01\x7f" ++
+        "\x03\x02\x01\x00" ++
+        "\x04\x04\x01\x70\x00\x01" ++
+        "\x0a\x06\x01\x04\x00\x41\x2a\x0b";
+
+    var module = try binary.Module.parse(allocator, wasm);
+    defer module.deinit();
+
+    var interp = Interpreter.init(allocator, &module);
+    defer interp.deinit();
+
+    var tables = try allocator.alloc(Table, 1);
+    defer allocator.free(tables);
+    tables[0] = try Table.init(allocator, .{ .elem_type = .funcref, .limits = .{ .min = 1, .max = null } });
+    defer tables[0].deinit();
+
+    interp.setTables(tables);
+
+    // Push -1 as signed i32 (large unsigned value)
+    try interp.stack.pushI32(-1);
+
+    const instr = binary.instructions.Instruction{
+        .opcode = .call_indirect,
+        .immediate = .{ .call_indirect = .{ .type_idx = 0, .table_idx = 0 } },
+    };
+
+    var reader = Reader.init(&[_]u8{});
+    // -1 as u32 = 0xFFFFFFFF, way out of bounds
+    try std.testing.expectError(error.TableOutOfBounds, interp.executeInstruction(instr, &reader));
 }

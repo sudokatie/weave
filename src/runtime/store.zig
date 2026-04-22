@@ -11,6 +11,14 @@ const Table = table_mod.Table;
 const Global = table_mod.Global;
 const Value = stack_mod.Value;
 
+/// Error types for init expression evaluation
+pub const InitExprError = error{
+    UnexpectedEof,
+    InvalidInitExpression,
+    InvalidGlobalIndex,
+    LEB128Overflow,
+};
+
 /// Address types for store
 pub const FuncAddr = u32;
 pub const TableAddr = u32;
@@ -121,8 +129,10 @@ pub const Store = struct {
         var global_addrs = try self.allocator.alloc(GlobalAddr, module.globals.len);
         for (0..module.globals.len) |i| {
             const addr: GlobalAddr = @intCast(self.globals.items.len);
-            // TODO: evaluate init expression
-            const glob = Global.init(module.globals[i].global_type, Value{ .i32 = 0 });
+            // Evaluate the init expression for this global
+            const init_value = self.evaluateInitExpr(module.globals[i].init) catch
+                Value.fromValType(module.globals[i].global_type.val_type);
+            const glob = Global.init(module.globals[i].global_type, init_value);
             try self.globals.append(self.allocator, glob);
             global_addrs[i] = addr;
         }
@@ -158,8 +168,8 @@ pub const Store = struct {
         for (module.data) |data| {
             if (data.mem_idx < mem_addrs.len) {
                 const mem = self.getMemory(mem_addrs[data.mem_idx]);
-                // Evaluate offset (simple case: i32.const followed by end)
-                const offset = evalConstExpr(data.offset);
+                // Evaluate offset expression
+                const offset = self.evalConstExpr(data.offset);
                 mem.fill(offset, data.init) catch {};
             }
         }
@@ -168,7 +178,7 @@ pub const Store = struct {
         for (module.elements) |elem| {
             if (elem.table_idx < table_addrs.len) {
                 const tbl = self.getTable(table_addrs[elem.table_idx]);
-                const offset = evalConstExpr(elem.offset);
+                const offset = self.evalConstExpr(elem.offset);
                 for (elem.init, 0..) |func_idx, i| {
                     tbl.set(offset + @as(u32, @intCast(i)), func_idx) catch {};
                 }
@@ -178,20 +188,55 @@ pub const Store = struct {
         return instance;
     }
 
-    /// Evaluate a constant expression (simplified: only handles i32.const)
-    fn evalConstExpr(expr: []const u8) u32 {
-        if (expr.len >= 2 and expr[0] == 0x41) { // i32.const
-            // Simple LEB128 decode
-            var result: u32 = 0;
-            var shift: u5 = 0;
-            for (expr[1..]) |byte| {
-                result |= @as(u32, byte & 0x7F) << shift;
-                if (byte & 0x80 == 0) break;
-                shift +|= 7;
+    /// Evaluate a constant init expression and return the resulting Value
+    /// Handles: i32.const, i64.const, f32.const, f64.const, global.get, end
+    pub fn evaluateInitExpr(self: *Store, expr: []const u8) InitExprError!Value {
+        var reader = binary.Reader.init(expr);
+
+        while (!reader.atEnd()) {
+            const opcode = reader.readByte() catch return error.UnexpectedEof;
+
+            switch (opcode) {
+                0x41 => { // i32.const
+                    const val = reader.readI32Leb128() catch return error.LEB128Overflow;
+                    return Value{ .i32 = val };
+                },
+                0x42 => { // i64.const
+                    const val = reader.readI64Leb128() catch return error.LEB128Overflow;
+                    return Value{ .i64 = val };
+                },
+                0x43 => { // f32.const
+                    const val = reader.readF32() catch return error.UnexpectedEof;
+                    return Value{ .f32 = val };
+                },
+                0x44 => { // f64.const
+                    const val = reader.readF64() catch return error.UnexpectedEof;
+                    return Value{ .f64 = val };
+                },
+                0x23 => { // global.get
+                    const idx = reader.readU32Leb128() catch return error.LEB128Overflow;
+                    if (idx >= self.globals.items.len) return error.InvalidGlobalIndex;
+                    return self.globals.items[idx].value;
+                },
+                0x0B => { // end
+                    // Should have returned a value before reaching end
+                    return error.InvalidInitExpression;
+                },
+                else => return error.InvalidInitExpression,
             }
-            return result;
         }
-        return 0;
+
+        return error.UnexpectedEof;
+    }
+
+    /// Evaluate a constant expression (simple version for offsets, returns u32)
+    fn evalConstExpr(self: *Store, expr: []const u8) u32 {
+        const val = self.evaluateInitExpr(expr) catch return 0;
+        return switch (val) {
+            .i32 => |v| @bitCast(v),
+            .i64 => |v| @truncate(@as(u64, @bitCast(v))),
+            else => 0,
+        };
     }
 
     pub fn getFunc(self: *Store, addr: FuncAddr) *FuncInst {
@@ -242,4 +287,124 @@ test "store instantiate simple module" {
     const exp = instance.getExport("test");
     try std.testing.expect(exp != null);
     try std.testing.expectEqual(binary.Module.ExportKind.func, exp.?.kind);
+}
+
+// Init expression evaluation tests
+test "evaluateInitExpr i32.const" {
+    const allocator = std.testing.allocator;
+    var store = Store.init(allocator);
+    defer store.deinit();
+
+    // i32.const 42, end
+    const expr = &[_]u8{ 0x41, 0x2a, 0x0b };
+    const val = try store.evaluateInitExpr(expr);
+    try std.testing.expectEqual(@as(i32, 42), val.i32);
+}
+
+test "evaluateInitExpr i32.const negative" {
+    const allocator = std.testing.allocator;
+    var store = Store.init(allocator);
+    defer store.deinit();
+
+    // i32.const -1 (0x7f in signed LEB128), end
+    const expr = &[_]u8{ 0x41, 0x7f, 0x0b };
+    const val = try store.evaluateInitExpr(expr);
+    try std.testing.expectEqual(@as(i32, -1), val.i32);
+}
+
+test "evaluateInitExpr i64.const" {
+    const allocator = std.testing.allocator;
+    var store = Store.init(allocator);
+    defer store.deinit();
+
+    // i64.const 100, end (100 in signed LEB128 = 0xe4, 0x00)
+    const expr = &[_]u8{ 0x42, 0xe4, 0x00, 0x0b };
+    const val = try store.evaluateInitExpr(expr);
+    try std.testing.expectEqual(@as(i64, 100), val.i64);
+}
+
+test "evaluateInitExpr f32.const" {
+    const allocator = std.testing.allocator;
+    var store = Store.init(allocator);
+    defer store.deinit();
+
+    // f32.const 1.0, end (IEEE 754: 0x3f800000)
+    const expr = &[_]u8{ 0x43, 0x00, 0x00, 0x80, 0x3f, 0x0b };
+    const val = try store.evaluateInitExpr(expr);
+    try std.testing.expectEqual(@as(f32, 1.0), val.f32);
+}
+
+test "evaluateInitExpr f64.const" {
+    const allocator = std.testing.allocator;
+    var store = Store.init(allocator);
+    defer store.deinit();
+
+    // f64.const 2.0, end (IEEE 754: 0x4000000000000000)
+    const expr = &[_]u8{ 0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x0b };
+    const val = try store.evaluateInitExpr(expr);
+    try std.testing.expectEqual(@as(f64, 2.0), val.f64);
+}
+
+test "evaluateInitExpr global.get" {
+    const allocator = std.testing.allocator;
+    var store = Store.init(allocator);
+    defer store.deinit();
+
+    // First add a global with value 123
+    const glob = Global.init(.{ .val_type = .i32, .mutable = false }, Value{ .i32 = 123 });
+    try store.globals.append(allocator, glob);
+
+    // global.get 0, end
+    const expr = &[_]u8{ 0x23, 0x00, 0x0b };
+    const val = try store.evaluateInitExpr(expr);
+    try std.testing.expectEqual(@as(i32, 123), val.i32);
+}
+
+test "evaluateInitExpr global.get chained" {
+    const allocator = std.testing.allocator;
+    var store = Store.init(allocator);
+    defer store.deinit();
+
+    // Add first global with value 456
+    const glob1 = Global.init(.{ .val_type = .i32, .mutable = false }, Value{ .i32 = 456 });
+    try store.globals.append(allocator, glob1);
+
+    // Add second global referencing first (simulated by adding with same value)
+    const glob2 = Global.init(.{ .val_type = .i32, .mutable = false }, Value{ .i32 = 456 });
+    try store.globals.append(allocator, glob2);
+
+    // global.get 1, end
+    const expr = &[_]u8{ 0x23, 0x01, 0x0b };
+    const val = try store.evaluateInitExpr(expr);
+    try std.testing.expectEqual(@as(i32, 456), val.i32);
+}
+
+test "evaluateInitExpr invalid opcode" {
+    const allocator = std.testing.allocator;
+    var store = Store.init(allocator);
+    defer store.deinit();
+
+    // i32.add (not allowed in init expressions), end
+    const expr = &[_]u8{ 0x6a, 0x0b };
+    try std.testing.expectError(error.InvalidInitExpression, store.evaluateInitExpr(expr));
+}
+
+test "evaluateInitExpr invalid global index" {
+    const allocator = std.testing.allocator;
+    var store = Store.init(allocator);
+    defer store.deinit();
+
+    // global.get 99 (doesn't exist), end
+    const expr = &[_]u8{ 0x23, 0x63, 0x0b };
+    try std.testing.expectError(error.InvalidGlobalIndex, store.evaluateInitExpr(expr));
+}
+
+test "evaluateInitExpr empty expression" {
+    const allocator = std.testing.allocator;
+    var store = Store.init(allocator);
+    defer store.deinit();
+
+    // Just end (invalid - no value produced)
+    const expr = &[_]u8{0x0b};
+    try std.testing.expectError(error.InvalidInitExpression, store.evaluateInitExpr(expr));
 }
